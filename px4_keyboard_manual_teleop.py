@@ -12,6 +12,9 @@ Before running, source your ROS 2 overlay that provides px4_msgs, e.g.:
 
 Run:
   python3 px4_keyboard_manual_teleop.py
+  # Jetson / SSH / missing X11 RECORD (record_create_context) — TTY input, no pynput:
+  TELEOP_USE_TTY=1 python3 px4_keyboard_manual_teleop.py
+  python3 px4_keyboard_manual_teleop.py --use-tty
 
 True open-loop (no commanded wrench unless you move sticks / keys):
   • FC must be in PX4 Manual (nav_state MANUAL), not Position/Hold/Mission/Offboard-position.
@@ -22,6 +25,12 @@ True open-loop (no commanded wrench unless you move sticks / keys):
 
 On Linux/Ubuntu terminals, arrow keys send escape sequences; the script disables TTY echo so you
 do not see stray characters like ^[A. If anything still prints, run: stty sane
+
+pynput requires the X11 RECORD extension (pynput → python-xlib → record_create_context). That often
+fails on Jetson / headless / Wayland / some SSH + X setups. If you see ``AttributeError:
+record_create_context`` or similar, use TTY input instead: ``TELEOP_USE_TTY=1`` or ``--use-tty``.
+TTY mode uses the same key map (WASD, arrows if your terminal sends VT sequences, M/A/D, etc.) and
+does not use X11.
 
 Controls (spacecraft Manual/direct mapping in SpacecraftRateControl):
   Arrow Up/Down     body X thrust (forward / back)
@@ -41,8 +50,11 @@ Safety: only use with props unpowered or vehicle restrained. You are responsible
 
 from __future__ import annotations
 
+import argparse
 import math
 import os
+import queue
+import select
 import sys
 import threading
 import time
@@ -52,11 +64,9 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 try:
-    from pynput import keyboard
-except ImportError as e:
-    raise SystemExit(
-        "Missing dependency: pynput. Install with: pip install pynput\n" + str(e)
-    ) from e
+    from pynput import keyboard as pynput_keyboard
+except ImportError:
+    pynput_keyboard = None  # TTY mode only; optional
 
 from px4_msgs.msg import VehicleCommand, ManualControlSetpoint
 
@@ -98,10 +108,26 @@ def _tty_restore(saved: tuple[int, list] | None) -> None:
         pass
 
 
+# TTY: stick inputs use short activity windows (repeat on hold); see _tty_key_loop.
+_TTY_ACTIVITY_S = 0.12
+
+
+def _env_flag(name: str) -> bool:
+    v = os.environ.get(name, "").strip().lower()
+    return v in ("1", "true", "yes", "y")
+
+
 class Px4KeyboardManualTeleop(Node):
     def __init__(self) -> None:
         super().__init__("px4_keyboard_manual_teleop")
         self._shutdown_requested = False
+        # pynput (X11) vs /dev/tty cbreak (Jetson, SSH, no X11 RECORD / Wayland)
+        if (not pynput_keyboard) or _env_flag("TELEOP_USE_TTY"):
+            self._use_tty = True
+        elif _env_flag("TELEOP_USE_PYNPUT"):
+            self._use_tty = False
+        else:
+            self._use_tty = False  # default: use pynput if installed
 
         self.declare_parameter("target_system", 1)
         self.declare_parameter("stick_gain", 0.85)  # max deflection [-1, 1]
@@ -144,41 +170,151 @@ class Px4KeyboardManualTeleop(Node):
         period = 1.0 / max(rate, 1.0)
 
         self._lock = threading.Lock()
-        self._pressed: set = set()
+        self._pressed: set = set()  # pynput: Key/KeyCode
+        # TTY: monotonic() timestamp of last activity per logical axis
+        self._last_activity: dict[str, float] = {}
+        self._event_q: "queue.SimpleQueue[str]" = queue.SimpleQueue()
+        self._listener = None
+        self._tty_thread: threading.Thread | None = None
 
         self._timer = self.create_timer(period, self._on_timer)
 
-        self._listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
-        self._listener.start()
-
-        self.get_logger().info(
-            "Started. M=Manual, A=arm (force=%s), D=disarm (force=%s). Arrows+Z/X. Q=quit."
-            % (self._force_arm, self._force_disarm)
-        )
+        if not self._use_tty:
+            self._listener = pynput_keyboard.Listener(
+                on_press=self._on_pynput_press, on_release=self._on_pynput_release
+            )
+            self._listener.start()
+            msg = (
+                "Started (pynput/X11). M=Manual, A=arm (force=%s), D=disarm (force=%s). Arrows+Z/X. Q=quit."
+                % (self._force_arm, self._force_disarm)
+            )
+        else:
+            if pynput_keyboard and _env_flag("TELEOP_USE_TTY"):
+                self.get_logger().info("Using TTY keyboard (TELEOP_USE_TTY) — set TELEOP_USE_PYNPUT=1 to prefer X11/pynput.")
+            elif not pynput_keyboard:
+                self.get_logger().info("pynput not installed — using TTY keyboard.")
+            self._tty_thread = threading.Thread(target=self._tty_key_loop, name="px4_tty_keys", daemon=True)
+            self._tty_thread.start()
+            msg = (
+                "Started (TTY). M=Manual, A=arm (force=%s), D=disarm (force=%s). "
+                "W/S=I/K pitch, J/L roll, arrows, Z/X yaw, Q=quit"
+                % (self._force_arm, self._force_disarm)
+            )
+        self.get_logger().info(msg)
 
     def destroy_node(self) -> bool:
+        self._shutdown_requested = True
         try:
-            self._listener.stop()
+            if self._listener is not None:
+                self._listener.stop()
         except Exception:
             pass
+        if self._tty_thread is not None and self._tty_thread.is_alive():
+            self._tty_thread.join(timeout=1.0)
         return super().destroy_node()
 
-    def _on_press(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        if key is None:
+    def _bump_activity(self, name: str) -> None:
+        with self._lock:
+            self._last_activity[name] = time.monotonic()
+
+    def _tty_key_loop(self) -> None:
+        import termios
+        import tty
+
+        if not sys.stdin.isatty():
+            self.get_logger().error("TTY mode requires an interactive terminal (stdin is not a TTY).")
+            return
+        fd = sys.stdin.fileno()
+        old = None
+        try:
+            old = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except (termios.error, OSError) as e:
+            self.get_logger().error("TTY setcbreak failed: %s" % e)
+            return
+        buf = bytearray()
+        try:
+            while not self._shutdown_requested:
+                r, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if not r or self._shutdown_requested:
+                    continue
+                chunk = os.read(fd, 64)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                while len(buf) > 0 and (not self._shutdown_requested):
+                    if buf[0] == 0x1B:
+                        if len(buf) < 2:
+                            break
+                        if buf[1:3] == b"[" and len(buf) < 3:
+                            break
+                        if buf[1:3] == b"[" and len(buf) >= 3:
+                            ch = buf[2]
+                            del buf[:3]
+                            if ch == 65:  # A
+                                self._bump_activity("pitch+")
+                            elif ch == 66:  # B
+                                self._bump_activity("pitch-")
+                            elif ch == 68:  # D
+                                self._bump_activity("roll-")
+                            elif ch == 67:  # C
+                                self._bump_activity("roll+")
+                        else:
+                            # ESC + non-bracket (e.g. alt combos): drop one byte
+                            del buf[0]
+                    else:
+                        c = bytes([buf[0]]).decode("utf-8", errors="replace")
+                        del buf[0:1]
+                        c = c.lower()
+                        if c in ("q",):
+                            self._shutdown_requested = True
+                            break
+                        if c == "m":
+                            self._event_q.put("manual")
+                        elif c == "a":
+                            self._event_q.put("arm")
+                        elif c == "d":
+                            self._event_q.put("disarm")
+                        elif c == " ":
+                            with self._lock:
+                                self._last_activity.clear()
+                        elif c in ("w", "i"):
+                            self._bump_activity("pitch+")
+                        elif c in ("s", "k"):
+                            self._bump_activity("pitch-")
+                        elif c == "j":
+                            self._bump_activity("roll-")
+                        elif c == "l":
+                            self._bump_activity("roll+")
+                        elif c == "z":
+                            self._bump_activity("yaw-")
+                        elif c == "x":
+                            self._bump_activity("yaw+")
+        finally:
+            if old is not None:
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                except OSError:
+                    pass
+
+    def _on_pynput_press(
+        self, key: pynput_keyboard.Key | pynput_keyboard.KeyCode | None
+    ) -> None:
+        if pynput_keyboard is None or key is None:
             return
         try:
-            if key == keyboard.Key.esc:
+            if key == pynput_keyboard.Key.esc:
                 self._shutdown_requested = True
-                raise keyboard.Listener.StopException()
+                raise pynput_keyboard.Listener.StopException()
             if getattr(key, "char", None) in ("q", "Q"):
                 self._shutdown_requested = True
-                raise keyboard.Listener.StopException()
-        except keyboard.Listener.StopException:
+                raise pynput_keyboard.Listener.StopException()
+        except pynput_keyboard.Listener.StopException:
             raise
         except Exception:
             pass
 
-        if key == keyboard.Key.space:
+        if key == pynput_keyboard.Key.space:
             with self._lock:
                 self._pressed.clear()
             return
@@ -195,7 +331,9 @@ class Px4KeyboardManualTeleop(Node):
         with self._lock:
             self._pressed.add(key)
 
-    def _on_release(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
+    def _on_pynput_release(
+        self, key: pynput_keyboard.Key | pynput_keyboard.KeyCode | None
+    ) -> None:
         if key is None:
             return
         with self._lock:
@@ -208,25 +346,47 @@ class Px4KeyboardManualTeleop(Node):
         roll = 0.0
         yaw = 0.0
 
-        with self._lock:
-            keys = set(self._pressed)
+        if self._use_tty:
+            now = time.monotonic()
 
-        if keyboard.Key.up in keys:
-            pitch += g
-        if keyboard.Key.down in keys:
-            pitch -= g
-        if keyboard.Key.left in keys:
-            roll -= g
-        if keyboard.Key.right in keys:
-            roll += g
+            def active(name: str) -> bool:
+                with self._lock:
+                    t0 = self._last_activity.get(name, 0.0)
+                return (now - t0) < _TTY_ACTIVITY_S
 
-        # yaw: Z / X (lowercase)
-        for k in keys:
-            if hasattr(k, "char") and k.char is not None:
-                if k.char.lower() == "z":
-                    yaw -= g
-                elif k.char.lower() == "x":
-                    yaw += g
+            if active("pitch+"):
+                pitch += g
+            if active("pitch-"):
+                pitch -= g
+            if active("roll-"):
+                roll -= g
+            if active("roll+"):
+                roll += g
+            if active("yaw-"):
+                yaw -= g
+            if active("yaw+"):
+                yaw += g
+        else:
+            if pynput_keyboard is None:
+                return 0.0, 0.0, 0.0
+            with self._lock:
+                keys = set(self._pressed)
+
+            if pynput_keyboard.Key.up in keys:
+                pitch += g
+            if pynput_keyboard.Key.down in keys:
+                pitch -= g
+            if pynput_keyboard.Key.left in keys:
+                roll -= g
+            if pynput_keyboard.Key.right in keys:
+                roll += g
+
+            for k in keys:
+                if hasattr(k, "char") and k.char is not None:
+                    if k.char.lower() == "z":
+                        yaw -= g
+                    elif k.char.lower() == "x":
+                        yaw += g
 
         def clamp(x: float) -> float:
             return max(-1.0, min(1.0, x))
@@ -288,6 +448,18 @@ class Px4KeyboardManualTeleop(Node):
             rclpy.shutdown()
             return
 
+        while True:
+            try:
+                ev = self._event_q.get_nowait()
+            except queue.Empty:
+                break
+            if ev == "manual":
+                self._send_manual_mode()
+            elif ev == "arm":
+                self._send_arm(True)
+            elif ev == "disarm":
+                self._send_arm(False)
+
         pitch, roll, yaw = self._sticks_from_keys()
 
         out = ManualControlSetpoint()
@@ -311,7 +483,17 @@ class Px4KeyboardManualTeleop(Node):
 
 
 def main() -> None:
-    tty_saved = _tty_echo_off()
+    ap = argparse.ArgumentParser(description="PX4 keyboard → manual_control_setpoint (ROS 2)")
+    ap.add_argument(
+        "--use-tty",
+        action="store_true",
+        help="Input via terminal (cbreak) instead of pynput; use on Jetson/SSH or if X11 RECORD is missing (record_create_context).",
+    )
+    args, _ = ap.parse_known_args()
+    if args.use_tty:
+        os.environ["TELEOP_USE_TTY"] = "1"
+    # Echo off helps pynput + terminal; TTY mode uses cbreak in the key thread
+    tty_saved: tuple[int, list] | None = _tty_echo_off() if not _env_flag("TELEOP_USE_TTY") else None
     rclpy.init()
     node = None
     try:
