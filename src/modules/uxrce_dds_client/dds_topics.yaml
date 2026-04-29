@@ -24,6 +24,11 @@ publications:
     type: px4_msgs::msg::VehicleControlMode
     rate_limit: 50.
 
+  # Merged output from ManualControl (RC + uXRCE, after COM_RC_IN_MODE selection)
+  - topic: /fmu/out/manual_control_setpoint
+    type: px4_msgs::msg::ManualControlSetpoint
+    rate_limit: 20.
+
   - topic: /fmu/out/vehicle_local_position
     type: px4_msgs::msg::VehicleLocalPosition
     rate_limit: 50.
