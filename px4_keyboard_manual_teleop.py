@@ -1,51 +1,36 @@
 #!/usr/bin/env python3
 """
-PX4 keyboard teleop: switch to Manual mode and drive manual_control_setpoint (arrow keys).
+PX4 keyboard teleop (ROS 2): publish ManualControlSetpoint + arm/mode commands.
 
-Requires ROS 2 (rclpy), px4_msgs, and pynput:
-  pip install pynput
-  # px4_msgs from a colcon workspace that matches your PX4 version
+This node publishes:
+  - /fmu/in/manual_control_input  (px4_msgs/ManualControlSetpoint)
+  - /fmu/in/vehicle_command       (px4_msgs/VehicleCommand) for Arm/Disarm/Manual mode
 
-Before running, source your ROS 2 overlay that provides px4_msgs, e.g.:
-  source /opt/ros/$ROS_DISTRO/setup.bash
-  source install/setup.bash   # if you built px4_msgs locally
+Prereqs:
+  - ROS 2 + px4_msgs in your environment
+  - Optional: pynput (X11) for global keyboard input. On Jetson/SSH/headless use TTY mode.
 
 Run:
   python3 px4_keyboard_manual_teleop.py
-  # Jetson / SSH / missing X11 RECORD (record_create_context) — TTY input, no pynput:
   TELEOP_USE_TTY=1 python3 px4_keyboard_manual_teleop.py
   python3 px4_keyboard_manual_teleop.py --use-tty
 
-True open-loop (no commanded wrench unless you move sticks / keys):
-  • FC must be in PX4 Manual (nav_state MANUAL), not Position/Hold/Mission/Offboard-position.
-    If QGC still station-keeps, you are not in Manual — verify nav_state and control_position.
-  • In Manual + spacecraft, centered inputs → zero thrust/torque from the manual/direct path.
-  • Disarm (D) when not testing so outputs stay in the disarmed state; do not arm until you intend to fire.
-  • Avoid a second manual source (QGC virtual stick, RC) fighting this node.
+Keys (spacecraft Manual/direct mapping):
+  - Up/Down arrows (or W/S, I/K): +X / -X thrust
+  - Left/Right arrows (or J/L):  -Y / +Y thrust
+  - Z / X:                        yaw torque left / right
+  - Space:                         zero sticks (next timer publishes p/r/y = 0)
+  - M:                             set PX4 main mode Manual
+  - A / D:                         arm / disarm
+  - Q (or Ctrl+C):                 quit
 
-On Linux/Ubuntu terminals, arrow keys send escape sequences; the script disables TTY echo so you
-do not see stray characters like ^[A. If anything still prints, run: stty sane
-
-pynput requires the X11 RECORD extension (pynput → python-xlib → record_create_context). That often
-fails on Jetson / headless / Wayland / some SSH + X setups. If you see ``AttributeError:
-record_create_context`` or similar, use TTY input instead: ``TELEOP_USE_TTY=1`` or ``--use-tty``.
-TTY mode uses the same key map (WASD, arrows if your terminal sends VT sequences, M/A/D, etc.) and
-does not use X11.
-
-Controls (spacecraft Manual/direct mapping in SpacecraftRateControl):
-  Arrow Up/Down     body X thrust (forward / back)
-  Arrow Left/Right    body Y thrust (left / right)
-  Z / X               yaw torque (left / right)
-  M                   send Manual mode (VEHICLE_CMD_DO_SET_MODE)
-  A / D               arm / disarm (default: same as `commander arm -f` / normal disarm — see parameters)
-  Space               zero all sticks
-  Q or Ctrl+C         quit
-
-Arming uses VEHICLE_CMD_COMPONENT_ARM_DISARM with param2=21196 when force_arm is true (PX4
-magic value used by `commander arm -f`). from_external is set false in that case so preflight
-checks are skipped like the NSH shell command — you cannot run `commander` itself from the host.
-
-Safety: only use with props unpowered or vehicle restrained. You are responsible for arming rules.
+Notes:
+  - Manual input source: this node sets data_source to MAVLink_0 by default. Ensure the FC
+    selects MAVLink manual control (e.g. COM_RC_IN_MODE=1 for keyboard-only), otherwise an RC
+    can “win” and drive outputs even if arming works from /vehicle_command.
+  - Logging: discrete commands (A/D/M, Space) log at INFO. To see live stick values, set
+    parameter log_manual_sticks_s (e.g. 0.5).
+  - Safety: test restrained/unpowered; arming enables outputs.
 """
 
 from __future__ import annotations
@@ -137,9 +122,16 @@ class Px4KeyboardManualTeleop(Node):
         # Match `commander arm -f` (VEHICLE_CMD_COMPONENT_ARM_DISARM + magic param2, from_external=false)
         self.declare_parameter("force_arm", True)
         self.declare_parameter("force_disarm", False)
-        # Manual stick throttle when not using throttle for translation [-1, 1]; -1 = full down (no +Z thrust cmd).
-        # Avoids NaN so arming checks / consumers see a defined idle input.
-        self.declare_parameter("idle_throttle", -1.0)
+        # [-1, 1]. Use 0 for spacecraft/keyboard: in SpacecraftRateControl ACRO path, body-Z is
+        #  -throttle, so 0 = no Z thrust. (-1 in that path is +1 Z; only use -1 for MC idle-down if needed.)
+        self.declare_parameter("idle_throttle", 0.0)
+        # ManualControlSelector: only RC, Mavlink, etc. count — not SOURCE_UNKNOWN (0). Use
+        # SOURCE_MAVLINK_0 (2) so uXRCE/ROS input is accepted when COM_RC_IN_MODE allows Mavlink.
+        self.declare_parameter("manual_data_source", 2)
+        # Log a line when Space zeros sticks / on other input events (TTY: queued to main thread).
+        self.declare_parameter("log_input_events", True)
+        # If > 0, log published manual p/r/y/throttle at this period (seconds). 0 = off.
+        self.declare_parameter("log_manual_sticks_s", 0.0)
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -166,6 +158,13 @@ class Px4KeyboardManualTeleop(Node):
         self._force_arm = self.get_parameter("force_arm").get_parameter_value().bool_value
         self._force_disarm = self.get_parameter("force_disarm").get_parameter_value().bool_value
         self._idle_throttle = self.get_parameter("idle_throttle").get_parameter_value().double_value
+        _ds = self.get_parameter("manual_data_source").get_parameter_value().integer_value
+        self._manual_data_source = int(_ds) if 0 <= int(_ds) < 8 else 2
+        self._log_on_zero = self.get_parameter("log_input_events").get_parameter_value().bool_value
+        self._log_manual_debug_iv = (
+            self.get_parameter("log_manual_sticks_s").get_parameter_value().double_value
+        )
+        self._last_debug_log_monotonic = 0.0
         rate = self.get_parameter("publish_rate_hz").get_parameter_value().double_value
         period = 1.0 / max(rate, 1.0)
 
@@ -201,6 +200,12 @@ class Px4KeyboardManualTeleop(Node):
                 % (self._force_arm, self._force_disarm)
             )
         self.get_logger().info(msg)
+        self.get_logger().info(
+            "ManualControl data_source=%d (MAVLink_0=2). If arming still moves solenoids from "
+            "another stick, set FC param COM_RC_IN_MODE=1 (Mavlink only) or power RC after this node "
+            "(COM_RC_IN_MODE=3 uses the first source until reboot, often RC)."
+            % (self._manual_data_source,)
+        )
 
     def destroy_node(self) -> bool:
         self._shutdown_requested = True
@@ -246,9 +251,12 @@ class Px4KeyboardManualTeleop(Node):
                     if buf[0] == 0x1B:
                         if len(buf) < 2:
                             break
-                        if buf[1:3] == b"[" and len(buf) < 3:
-                            break
-                        if buf[1:3] == b"[" and len(buf) >= 3:
+                        # CSI: ESC [ P ... — must check buf[1] == '[', not buf[1:3] == b"["
+                        # (else ESC [ A gives buf[1:3] as b'[A', never matches, only ESC is dropped,
+                        # and the trailing "A"/"D" are read as a/d -> arm/disarm by mistake).
+                        if buf[1] == 0x5B:  # [
+                            if len(buf) < 3:
+                                break
                             ch = buf[2]
                             del buf[:3]
                             if ch == 65:  # A
@@ -278,6 +286,7 @@ class Px4KeyboardManualTeleop(Node):
                         elif c == " ":
                             with self._lock:
                                 self._last_activity.clear()
+                            self._event_q.put("zero_sticks")
                         elif c in ("w", "i"):
                             self._bump_activity("pitch+")
                         elif c in ("s", "k"):
@@ -317,6 +326,7 @@ class Px4KeyboardManualTeleop(Node):
         if key == pynput_keyboard.Key.space:
             with self._lock:
                 self._pressed.clear()
+            self._event_q.put("zero_sticks")
             return
 
         if hasattr(key, "char") and key.char is not None:
@@ -459,6 +469,9 @@ class Px4KeyboardManualTeleop(Node):
                 self._send_arm(True)
             elif ev == "disarm":
                 self._send_arm(False)
+            elif ev == "zero_sticks":
+                if self._log_on_zero:
+                    self.get_logger().info("Zeroed manual sticks (next publishes p/r/y=0 at timer rate)")
 
         pitch, roll, yaw = self._sticks_from_keys()
 
@@ -466,7 +479,7 @@ class Px4KeyboardManualTeleop(Node):
         out.timestamp = self._stamp_us()
         out.timestamp_sample = out.timestamp
         out.valid = True
-        out.data_source = ManualControlSetpoint.SOURCE_UNKNOWN
+        out.data_source = self._manual_data_source
         out.pitch = float(pitch)
         out.roll = float(roll)
         out.yaw = float(yaw)
@@ -480,6 +493,17 @@ class Px4KeyboardManualTeleop(Node):
         out.buttons = 0
 
         self._pub_manual.publish(out)
+
+        iv = float(self._log_manual_debug_iv)
+        if iv > 0.0:
+            nowm = time.monotonic()
+            if (nowm - self._last_debug_log_monotonic) >= iv:
+                self._last_debug_log_monotonic = nowm
+                self.get_logger().info(
+                    "Published ManualControl: pitch=%.3f roll=%.3f yaw=%.3f thr=%.3f (open-loop; "
+                    "see /fmu/out/manual_control_setpoint on FC to compare after selector)"
+                    % (pitch, roll, yaw, float(self._idle_throttle))
+                )
 
 
 def main() -> None:
