@@ -732,7 +732,28 @@ ControlAllocator::publish_actuator_controls()
 	for (motors_idx = 0; motors_idx < _num_actuators[0] && motors_idx < actuator_motors_s::NUM_CONTROLS; motors_idx++) {
 		int selected_matrix = _control_allocation_selection_indexes[actuator_idx];
 		float actuator_sp = _control_allocation[selected_matrix]->getActuatorSetpoint()(actuator_idx_matrix[selected_matrix]);
-		actuator_motors.control[motors_idx] = PX4_ISFINITE(actuator_sp) ? actuator_sp : NAN;
+
+		// Spacecraft thrusters/solenoids: if a motor is not marked reversible, negative thrust cannot be
+		// produced, and *zero* thrust should not map to an "active" PWM (motor interpolation maps 0 -> center).
+		// Represent "valve closed" as NaN, which maps to the per-channel disarmed value in the mixer/output layer.
+		const bool spacecraft_airframe =
+			(_param_ca_airframe.get() == (int32_t)EffectivenessSource::SPACECRAFT_2D)
+			|| (_param_ca_airframe.get() == (int32_t)EffectivenessSource::SPACECRAFT_3D);
+
+		static constexpr float SC_THRUSTER_CLOSE_EPS = 1e-5f;
+
+		if (!PX4_ISFINITE(actuator_sp)) {
+			actuator_motors.control[motors_idx] = NAN;
+
+		} else if (spacecraft_airframe
+			   && !(_param_r_rev.get() & (1u << motors_idx))
+			   && (actuator_sp <= SC_THRUSTER_CLOSE_EPS)) {
+			actuator_motors.control[motors_idx] = NAN;
+
+		} else {
+			actuator_motors.control[motors_idx] = actuator_sp;
+		}
+
 		++actuator_idx_matrix[selected_matrix];
 		++actuator_idx;
 	}
