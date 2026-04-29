@@ -33,6 +33,8 @@
 
 #include "ActuatorEffectivenessSpacecraft.hpp"
 
+#include <mathlib/math/Limits.hpp>
+
 using namespace matrix;
 
 ActuatorEffectivenessSpacecraft::ActuatorEffectivenessSpacecraft(ModuleParams *parent)
@@ -59,6 +61,36 @@ void ActuatorEffectivenessSpacecraft::updateSetpoint(const matrix::Vector<float,
 		int matrix_index, ActuatorVector &actuator_sp, const matrix::Vector<float, NUM_ACTUATORS> &actuator_min,
 		const matrix::Vector<float, NUM_ACTUATORS> &actuator_max)
 {
-	// TODO(@E-Krantz): Here is where we can add the nonlinearity of multiple thrusters open
-	//   and how to adjust thrust in that time
+	(void)actuator_min;
+	(void)actuator_max;
+
+	// Spacecraft thrusters are often solenoid-driven. For these actuators, "no commanded wrench"
+	// should produce a true "valves closed" output even while armed. PX4's output mapping treats
+	// finite actuator_motors values (including 0) as an active command, which maps to the midpoint
+	// of PWM min..max. However, NaN actuator setpoints propagate through ControlAllocator and are
+	// converted to NaN in actuator_motors, which the mixer/output layer interprets as "use disarmed
+	// value" for that channel.
+	//
+	// Therefore: when the requested torque+thrust setpoint is essentially zero, force all spacecraft
+	// thrusters to NaN so MAIN outputs remain at their disarmed values instead of ramping to a center
+	// PWM on arm.
+	if (matrix_index != 0) {
+		return;
+	}
+
+	const float torque_norm = math::max(math::max(fabsf(control_sp(0)), fabsf(control_sp(1))), fabsf(control_sp(2)));
+	const float thrust_norm = math::max(math::max(fabsf(control_sp(3)), fabsf(control_sp(4))), fabsf(control_sp(5)));
+
+	// Deadband: cover numerical noise from allocation and setpoint publishing.
+	static constexpr float IDLE_WRENCH_EPS = 1e-4f;
+
+	if (torque_norm <= IDLE_WRENCH_EPS && thrust_norm <= IDLE_WRENCH_EPS) {
+		const int n = _sc_thrusters.geometry().num_rotors;
+
+		const int m = math::min(n, static_cast<int>(actuator_sp.size()));
+
+		for (int i = 0; i < m; i++) {
+			actuator_sp(i) = NAN;
+		}
+	}
 }
