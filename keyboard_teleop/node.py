@@ -80,12 +80,14 @@ class KeyboardManualTeleop(Node):
         super().__init__("keyboard_manual_teleop")
         self._shutdown_requested = False
 
-        if (not pynput_keyboard) or _env_flag("TELEOP_USE_TTY"):
+        # Default to TTY: pynput on X needs XRECORD; Jetson/minimal-X often lacks it (fails asynchronously).
+        # Opt in with TELEOP_USE_PYNPUT=1 or launcher --use-x11-pynput.
+        if not pynput_keyboard or _env_flag("TELEOP_USE_TTY"):
             self._use_tty = True
         elif _env_flag("TELEOP_USE_PYNPUT"):
             self._use_tty = False
         else:
-            self._use_tty = False
+            self._use_tty = True
 
         self.declare_parameter("target_system", 1)
         self.declare_parameter("stick_gain", 0.85)  # max deflection [-1, 1]
@@ -176,13 +178,24 @@ class KeyboardManualTeleop(Node):
                 on_press=self._on_pynput_press, on_release=self._on_pynput_release
             )
             listener.start()
-            # RECORD extension required; crashes in background thread on many Jetsons / Wayland / minimal X
-            time.sleep(0.35)
+            # RECORD failures can occur after start(); wait until backend thread dies or survives ~2s.
+            stabile_ok = False
+            deadline = time.monotonic() + 2.0
+            while True:
+                backend_thread = getattr(listener, "_thread", None)
+                if backend_thread is None or not backend_thread.is_alive():
+                    stabile_ok = False
+                    break
+                if time.monotonic() >= deadline:
+                    stabile_ok = True
+                    break
+                time.sleep(0.1)
+
             backend_thread = getattr(listener, "_thread", None)
-            if backend_thread is not None and backend_thread.is_alive():
+            if stabile_ok and backend_thread is not None and backend_thread.is_alive():
                 self._listener = listener
                 msg = (
-                    "Started (pynput/X11). M=Manual, A=arm (force=%s), D=disarm (force=%s). "
+                    "Started (pynput/X11 RECORD). M=Manual, A=arm (force=%s), D=disarm (force=%s). "
                     "Arrows+Z/X. Q=quit."
                     % (self._force_arm, self._force_disarm)
                 )
@@ -194,18 +207,24 @@ class KeyboardManualTeleop(Node):
                 self._listener = None
                 self._use_tty = True
                 self.get_logger().warning(
-                    "pynput/X11 RECORD is not available on this session (Jetson/minimal-X/Wayland). "
-                    "Falling back to TTY keyboard. Use: python keyboard_manual_teleop.py --use-tty "
-                    "or TELEOP_USE_TTY=1 from an interactive terminal."
+                    "pynput/X11 RECORD unavailable (record_create_context). "
+                    "Falling back to TTY. For global keys on desktop with working RECORD: "
+                    "TELEOP_USE_PYNPUT=1 or --use-x11-pynput. Run from interactive TTY/ssh -t for TTY mode."
                 )
 
         if self._use_tty:
-            if pynput_keyboard and _env_flag("TELEOP_USE_TTY"):
-                self.get_logger().info(
-                    "Using TTY keyboard (TELEOP_USE_TTY) — set TELEOP_USE_PYNPUT=1 to prefer X11/pynput."
-                )
-            elif not pynput_keyboard:
+            if not pynput_keyboard:
                 self.get_logger().info("pynput not installed — using TTY keyboard.")
+            elif _env_flag("TELEOP_USE_TTY"):
+                self.get_logger().info(
+                    "Using TTY keyboard (TELEOP_USE_TTY). For X11/pynput: TELEOP_USE_PYNPUT=1 or "
+                    "--use-x11-pynput."
+                )
+            elif not _env_flag("TELEOP_USE_PYNPUT"):
+                self.get_logger().info(
+                    "TTY keyboard (default; avoids XRECORD). For global X11 keys: "
+                    "TELEOP_USE_PYNPUT=1 or --use-x11-pynput."
+                )
             self._tty_thread = threading.Thread(
                 target=self._tty_key_loop, name="keyboard_tty_keys", daemon=True
             )
