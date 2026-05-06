@@ -59,7 +59,8 @@ class CsvLogger:
             "cmd_torque_x",
             "cmd_torque_y",
             "cmd_torque_z",
-            # IMU (SensorCombined)
+            # IMU (SensorCombined); imu_have_msg=0 means IMU floats are NaN (no DDS sample latched yet)
+            "imu_have_msg",
             "imu_timestamp_us",
             "imu_gyro_rad_s_x",
             "imu_gyro_rad_s_y",
@@ -68,6 +69,7 @@ class CsvLogger:
             "imu_accel_m_s2_y",
             "imu_accel_m_s2_z",
             # Odometry (VehicleOdometry)
+            "odom_have_msg",
             "odom_timestamp_us",
             "odom_position_x",
             "odom_position_y",

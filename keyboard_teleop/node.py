@@ -104,33 +104,50 @@ class KeyboardManualTeleop(Node):
         self.declare_parameter("log_csv", True)
         self.declare_parameter("log_csv_path", "")
 
-        qos = QoSProfile(
+        # Publishers: PX4 listens on /fmu/in/* with typical command QoS.
+        qos_cmd = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
+        # Subscribers on /fmu/out/* MUST match PX4 uXRCE-DDS publishers: volatile + best_effort,
+        # not TRANSIENT_LOCAL — mismatched durability means zero samples (CSV IMU stays NaN forever).
+        qos_out = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
 
         self._pub_cmd = self.create_publisher(
             VehicleCommand,
             self.get_parameter("cmd_topic_vehicle_command").get_parameter_value().string_value,
-            qos,
+            qos_cmd,
         )
         self._pub_manual = self.create_publisher(
             ManualControlSetpoint,
             self.get_parameter("cmd_topic_manual_control").get_parameter_value().string_value,
-            qos,
+            qos_cmd,
         )
 
         # Subscriptions for logging/alignment (latest-sample latch)
         self._sub_sensor_combined = self.create_subscription(
-            SensorCombined, "/fmu/out/sensor_combined", self._on_sensor_combined, qos
+            SensorCombined,
+            "/fmu/out/sensor_combined",
+            self._on_sensor_combined,
+            qos_out,
         )
         self._sub_vehicle_odometry = self.create_subscription(
-            VehicleOdometry, "/fmu/out/vehicle_odometry", self._on_vehicle_odometry, qos
+            VehicleOdometry,
+            "/fmu/out/vehicle_odometry",
+            self._on_vehicle_odometry,
+            qos_out,
         )
         self._last_sensor_combined: SensorCombined | None = None
         self._last_vehicle_odometry: VehicleOdometry | None = None
+        self._csv_missing_imu_warned = False
+        self._csv_missing_odom_warned = False
 
         self._target_system = (
             self.get_parameter("target_system").get_parameter_value().integer_value
@@ -499,6 +516,21 @@ class KeyboardManualTeleop(Node):
         imu = self._last_sensor_combined
         odom = self._last_vehicle_odometry
 
+        if imu is None and not self._csv_missing_imu_warned:
+            self._csv_missing_imu_warned = True
+            self.get_logger().warning(
+                "CSV IMU columns are NaN until we receive DDS on /fmu/out/sensor_combined "
+                "(subscriber uses volatile/best_effort to match PX4; same ROS_DOMAIN_ID; agent running). "
+                "Check: ros2 topic hz /fmu/out/sensor_combined"
+            )
+        if odom is None and not self._csv_missing_odom_warned:
+            self._csv_missing_odom_warned = True
+            self.get_logger().warning(
+                "CSV odometry columns are NaN until we receive DDS on /fmu/out/vehicle_odometry "
+                "(subscriber uses volatile/best_effort; estimator publishes when ready). "
+                "Check: ros2 topic hz /fmu/out/vehicle_odometry"
+            )
+
         def _f(x: float) -> float:
             return float(x)
 
@@ -518,6 +550,7 @@ class KeyboardManualTeleop(Node):
             "cmd_torque_y": 0.0,
             "cmd_torque_z": float(manual.yaw),
             # IMU
+            "imu_have_msg": int(imu is not None),
             "imu_timestamp_us": int(imu.timestamp) if imu is not None else 0,
             "imu_gyro_rad_s_x": _f(imu.gyro_rad[0]) if imu is not None else float("nan"),
             "imu_gyro_rad_s_y": _f(imu.gyro_rad[1]) if imu is not None else float("nan"),
@@ -526,6 +559,7 @@ class KeyboardManualTeleop(Node):
             "imu_accel_m_s2_y": _f(imu.accelerometer_m_s2[1]) if imu is not None else float("nan"),
             "imu_accel_m_s2_z": _f(imu.accelerometer_m_s2[2]) if imu is not None else float("nan"),
             # Odom
+            "odom_have_msg": int(odom is not None),
             "odom_timestamp_us": int(odom.timestamp) if odom is not None else 0,
             "odom_position_x": _f(odom.position[0]) if odom is not None else float("nan"),
             "odom_position_y": _f(odom.position[1]) if odom is not None else float("nan"),
