@@ -168,16 +168,38 @@ class KeyboardManualTeleop(Node):
 
         self._timer = self.create_timer(period, self._on_timer)
 
-        if not self._use_tty:
-            self._listener = pynput_keyboard.Listener(
+        msg = ""
+
+        want_pynput = (not self._use_tty) and (pynput_keyboard is not None)
+        if want_pynput:
+            listener = pynput_keyboard.Listener(
                 on_press=self._on_pynput_press, on_release=self._on_pynput_release
             )
-            self._listener.start()
-            msg = (
-                "Started (pynput/X11). M=Manual, A=arm (force=%s), D=disarm (force=%s). Arrows+Z/X. Q=quit."
-                % (self._force_arm, self._force_disarm)
-            )
-        else:
+            listener.start()
+            # RECORD extension required; crashes in background thread on many Jetsons / Wayland / minimal X
+            time.sleep(0.35)
+            backend_thread = getattr(listener, "_thread", None)
+            if backend_thread is not None and backend_thread.is_alive():
+                self._listener = listener
+                msg = (
+                    "Started (pynput/X11). M=Manual, A=arm (force=%s), D=disarm (force=%s). "
+                    "Arrows+Z/X. Q=quit."
+                    % (self._force_arm, self._force_disarm)
+                )
+            else:
+                try:
+                    listener.stop()
+                except Exception:
+                    pass
+                self._listener = None
+                self._use_tty = True
+                self.get_logger().warning(
+                    "pynput/X11 RECORD is not available on this session (Jetson/minimal-X/Wayland). "
+                    "Falling back to TTY keyboard. Use: python keyboard_manual_teleop.py --use-tty "
+                    "or TELEOP_USE_TTY=1 from an interactive terminal."
+                )
+
+        if self._use_tty:
             if pynput_keyboard and _env_flag("TELEOP_USE_TTY"):
                 self.get_logger().info(
                     "Using TTY keyboard (TELEOP_USE_TTY) — set TELEOP_USE_PYNPUT=1 to prefer X11/pynput."
