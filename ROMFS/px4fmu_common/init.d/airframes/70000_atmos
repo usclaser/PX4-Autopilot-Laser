@@ -194,11 +194,14 @@ param set-default PWM_MAIN_MIN7 0
 param set-default PWM_MAIN_MIN8 0
 
 # BOARD_PWM_FREQ is downscaled by 10, thus PWM value is given in 10s of usec
-param set-default PWM_MAIN_MAX1 10000
-param set-default PWM_MAIN_MAX2 10000
-param set-default PWM_MAIN_MAX3 10000
-param set-default PWM_MAIN_MAX4 10000
-param set-default PWM_MAIN_MAX5 10000
-param set-default PWM_MAIN_MAX6 10000
-param set-default PWM_MAIN_MAX7 10000
-param set-default PWM_MAIN_MAX8 10000
+# To clarify, the downscaling of 10 is based o the PWM_AUX_TIMx = 10
+# So, for a freq of 25 Hz, should be 100000/25 = 4000 usec
+# And for a freq of 10 Hz, should be 100000/10 = 10000 usec
+param set-default PWM_MAIN_MAX1 4000
+param set-default PWM_MAIN_MAX2 4000
+param set-default PWM_MAIN_MAX3 4000
+param set-default PWM_MAIN_MAX4 4000
+param set-default PWM_MAIN_MAX5 4000
+param set-default PWM_MAIN_MAX6 4000
+param set-default PWM_MAIN_MAX7 4000
+param set-default PWM_MAIN_MAX8 4000
